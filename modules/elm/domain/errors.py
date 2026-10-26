@@ -1,4 +1,5 @@
-"""Pure Python domain errors for ELM."""
+"""Pure Python domain errors for ELM.
+"""
 from __future__ import annotations
 
 
@@ -16,3 +17,11 @@ class InsufficientBalanceError(ElmDomainError):
 
 class LeaveValidationError(ElmDomainError):
     """Raised when application inputs fail domain business validation rules."""
+
+# Export public symbols for convenient imports
+__all__ = [
+    "ElmDomainError",
+    "InvalidLeaveTransitionError",
+    "InsufficientBalanceError",
+    "LeaveValidationError",
+]
