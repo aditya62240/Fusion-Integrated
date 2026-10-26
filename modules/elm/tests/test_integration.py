@@ -196,6 +196,9 @@ def test_cancel_approved_leave_and_refund_balance(stub_iam):
     bal_approved = LeaveBalance.objects.get(user_id=user_id, year=2026, category="RH")
     assert bal_approved.availed_balance == Decimal("1.00")
 
+    # Restore applicant session before cancellation (stub_iam is global – last _client() wins)
+    c_user = _client(stub_iam, user_id=user_id)
+
     # Now cancel prior to start date
     cancel_res = c_user.post(
         f"/api/v1/elm/leaves/{leave_id}/cancel/",
@@ -223,6 +226,88 @@ def test_invalid_date_range_refusal(stub_iam):
         "start_date": "2026-11-20",
         "end_date": "2026-11-15",
         "reason": "Inverted dates",
+    }
+    res = c.post("/api/v1/elm/leaves/", payload, format="json")
+    assert res.status_code == 400
+
+
+@pytest.mark.django_db
+def test_overlapping_leave_rejected(stub_iam):
+    """Two applications covering the same dates must be rejected (BR-EL-012)."""
+    user_id = 111
+    seed_default_balances(user_id, 2026)
+    c = _client(stub_iam, user_id=user_id)
+
+    payload = {
+        "category": "CL",
+        "start_date": "2026-11-25",
+        "end_date": "2026-11-26",
+        "reason": "First application",
+    }
+    res1 = c.post("/api/v1/elm/leaves/", payload, format="json")
+    assert res1.status_code == 201
+
+    # Second application overlaps the first
+    payload["reason"] = "Second application — should be rejected"
+    res2 = c.post("/api/v1/elm/leaves/", payload, format="json")
+    assert res2.status_code == 400
+
+
+@pytest.mark.django_db
+def test_ownership_enforced_on_withdraw(stub_iam):
+    """A user cannot withdraw another user's leave application."""
+    owner_id = 112
+    intruder_id = 113
+    seed_default_balances(owner_id, 2026)
+
+    c_owner = _client(stub_iam, user_id=owner_id)
+    payload = {
+        "category": "CL",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-01",
+        "reason": "Owner's leave",
+    }
+    create_res = c_owner.post("/api/v1/elm/leaves/", payload, format="json")
+    leave_id = create_res.json()["id"]
+
+    c_intruder = _client(stub_iam, user_id=intruder_id)
+    del_res = c_intruder.delete(f"/api/v1/elm/leaves/{leave_id}/")
+    assert del_res.status_code == 404   # 404 not 403 — don't leak existence
+
+
+@pytest.mark.django_db
+def test_station_leave_requires_address_and_phone(stub_iam):
+    """Station leave must supply station_address and emergency_phone (serializer validation)."""
+    user_id = 114
+    seed_default_balances(user_id, 2026)
+    c = _client(stub_iam, user_id=user_id)
+
+    payload = {
+        "category": "CL",
+        "start_date": "2026-12-02",
+        "end_date": "2026-12-02",
+        "reason": "Conference trip",
+        "leaving_station": True,
+        # station_address and emergency_phone intentionally omitted
+    }
+    res = c.post("/api/v1/elm/leaves/", payload, format="json")
+    assert res.status_code == 400
+
+
+@pytest.mark.django_db
+def test_half_day_with_different_dates_rejected_by_serializer(stub_iam):
+    """Serializer rejects half-day leave spanning multiple days before service is called."""
+    user_id = 115
+    seed_default_balances(user_id, 2026)
+    c = _client(stub_iam, user_id=user_id)
+
+    payload = {
+        "category": "CL",
+        "start_date": "2026-12-10",
+        "end_date": "2026-12-11",
+        "reason": "Half day but spans two days",
+        "is_half_day": True,
+        "half_day_period": "first_half",
     }
     res = c.post("/api/v1/elm/leaves/", payload, format="json")
     assert res.status_code == 400

@@ -137,6 +137,28 @@ class LeaveApplicationCreateSerializer(serializers.Serializer):
         required=False, allow_null=True
     )
 
+    def validate(self, attrs):
+        start = attrs.get("start_date")
+        end = attrs.get("end_date")
+        if start and end and start > end:
+            raise serializers.ValidationError(
+                {"end_date": "end_date must not be before start_date."}
+            )
+        if attrs.get("is_half_day") and start and end and start != end:
+            raise serializers.ValidationError(
+                {"end_date": "Half-day leave must have identical start and end dates."}
+            )
+        if attrs.get("leaving_station"):
+            if not attrs.get("station_address"):
+                raise serializers.ValidationError(
+                    {"station_address": "station_address is required when leaving_station is true."}
+                )
+            if not attrs.get("emergency_phone"):
+                raise serializers.ValidationError(
+                    {"emergency_phone": "emergency_phone is required when leaving_station is true."}
+                )
+        return attrs
+
 
 class SubstituteResponseSerializer(serializers.Serializer):
     accepted = serializers.BooleanField()

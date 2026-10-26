@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 from django.db import transaction
 
-from modules.elm.domain.calculations import calculate_leave_days
+from modules.elm.domain.calculations import calculate_leave_days, check_date_overlap
 from modules.elm.domain.entities import LeaveCategory, LeaveStatus
 from modules.elm.domain.errors import (
     InsufficientBalanceError,
@@ -77,6 +77,24 @@ def apply_for_leave(
         raise InsufficientBalanceError(
             f"Insufficient {category} quota: requested {days_dec} days, but available balance is {bal.available_balance} days."
         )
+
+    # Overlap check: reject if any active/pending application already covers these dates (BR-EL-012)
+    existing = LeaveRequest.objects.filter(
+        user_id=user_id,
+        status__in=[
+            "awaiting_substitute",
+            "substitute_declined",
+            "awaiting_unit_head",
+            "awaiting_sanction",
+            "approved",
+        ],
+    )
+    for existing_req in existing:
+        if check_date_overlap(start_date, end_date, existing_req.start_date, existing_req.end_date):
+            raise LeaveValidationError(
+                f"Dates overlap with existing leave application #{existing_req.id} "
+                f"({existing_req.start_date} \u2013 {existing_req.end_date}, status: {existing_req.status})."
+            )
 
     # Determine initial status
     requires_substitute = substitute_user_id is not None and substitute_user_id > 0

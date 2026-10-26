@@ -1,12 +1,27 @@
-"""DRF API views for Employee Leave Management (ELM)."""
+"""DRF API views for Employee Leave Management (ELM).
+
+Authorization model
+-------------------
+Every view is gated by:
+  1. HasModuleGrant("elm")         – the module is enabled for the caller's role
+  2. HasPermission("elm.leave.X")  – the caller holds the specific fine-grained permission
+
+Ownership
+---------
+Employees may only read/withdraw/cancel their own applications.
+Action endpoints (substitute-respond, unit-head-review, sanction) validate that the
+caller is the designated actor recorded on the leave request.
+"""
 from __future__ import annotations
 
 from datetime import date
-from rest_framework import generics, status
+
+from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from core.api.exceptions import BadRequestError, ConflictError, NotFoundError
+from core.api.exceptions import BadRequestError, ConflictError, NotFoundError, PermissionDeniedError
+from fusion_auth.permissions import HasModuleGrant, HasPermission
 from modules.elm.domain.errors import (
     InsufficientBalanceError,
     InvalidLeaveTransitionError,
@@ -24,33 +39,48 @@ from modules.elm.services import (
 )
 from modules.elm.api import serializers as s
 
+# ── Permission objects (reused across views) ──────────────────────────────────
+MODULE = HasModuleGrant("elm")
+P_APPLY = HasPermission("elm.leave.apply")
+P_VIEW_SELF = HasPermission("elm.leave.view_self")
+P_SUBSTITUTE = HasPermission("elm.leave.substitute")
+P_REVIEW = HasPermission("elm.leave.review")
+P_SANCTION = HasPermission("elm.leave.sanction")
+P_ADMIN = HasPermission("elm.leave.admin")
+
 
 def _actor_user_id(request) -> int:
-    """Extract authenticated actor user ID with multi-layer fallback for test suites."""
+    """Extract the authenticated actor's user_id.  Raises 401 if not resolvable."""
     principal = getattr(request, "principal", None)
     if principal and getattr(principal, "user_id", None):
         return int(principal.user_id)
     user = getattr(request, "user", None)
-    if user and getattr(user, "user_id", None):
-        return int(user.user_id)
-    if user and getattr(user, "id", None) and str(user.id).isdigit():
+    if user and getattr(user, "id", None):
         return int(user.id)
-    hdr = request.META.get("HTTP_X_USER_ID")
-    if hdr and hdr.isdigit():
-        return int(hdr)
-    return 1
+    # Permit test header only when DEBUG is True
+    from django.conf import settings
+    if getattr(settings, "DEBUG", False):
+        hdr = request.META.get("HTTP_X_USER_ID")
+        if hdr and hdr.isdigit():
+            return int(hdr)
+    raise BadRequestError("Unable to determine authenticated user.")
 
+
+# ── Employee endpoints ────────────────────────────────────────────────────────
 
 class MyLeavesView(APIView):
     """List caller's own leave applications or submit a new leave application."""
+    permission_classes = [MODULE, P_VIEW_SELF]
 
     def get(self, request):
         user_id = _actor_user_id(request)
         qs = leave_selectors.visible_leaves_for_user(user_id)
-        serializer = s.LeaveRequestSerializer(qs, many=True)
-        return Response(serializer.data)
+        return Response(s.LeaveRequestSerializer(qs, many=True).data)
 
     def post(self, request):
+        # Posting also requires apply permission in addition to view_self
+        if not P_APPLY().has_permission(request, self):
+            raise PermissionDeniedError("elm.leave.apply permission required to submit a leave application.")
         user_id = _actor_user_id(request)
         serializer = s.LeaveApplicationCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -82,16 +112,25 @@ class MyLeavesView(APIView):
 
 
 class LeaveDetailWithdrawView(APIView):
-    """Retrieve details of a leave application or withdraw an in-flight request."""
+    """Retrieve own leave application details, or withdraw an in-flight request."""
+    permission_classes = [MODULE, P_VIEW_SELF]
 
-    def get(self, request, pk: int):
+    def _own_leave_or_404(self, pk: int, user_id: int):
         req = leave_selectors.get_leave_by_id(pk)
         if not req:
             raise NotFoundError(f"Leave application #{pk} does not exist.")
+        if req.user_id != user_id:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")  # 404 not 403 (don't leak existence)
+        return req
+
+    def get(self, request, pk: int):
+        user_id = _actor_user_id(request)
+        req = self._own_leave_or_404(pk, user_id)
         return Response(s.LeaveRequestSerializer(req).data)
 
     def delete(self, request, pk: int):
         user_id = _actor_user_id(request)
+        self._own_leave_or_404(pk, user_id)  # ownership check before service call
         try:
             req = application_services.withdraw_leave(leave_id=pk, actor_user_id=user_id)
             return Response(s.LeaveRequestSerializer(req).data)
@@ -100,10 +139,18 @@ class LeaveDetailWithdrawView(APIView):
 
 
 class LeaveCancellationView(APIView):
-    """Request pre-start cancellation of an approved leave application."""
+    """Request pre-start cancellation of caller's own approved leave."""
+    permission_classes = [MODULE, P_VIEW_SELF]
 
     def post(self, request, pk: int):
         user_id = _actor_user_id(request)
+        # Ownership: only the applicant may cancel their own leave
+        req = leave_selectors.get_leave_by_id(pk)
+        if not req:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+        if req.user_id != user_id:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+
         serializer = s.CancellationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         remarks = serializer.validated_data.get("remarks", "")
@@ -120,10 +167,17 @@ class LeaveCancellationView(APIView):
 
 
 class LeaveResumptionView(APIView):
-    """Record confirmation of duty resumption following leave completion."""
+    """Record duty resumption after approved leave completion."""
+    permission_classes = [MODULE, P_VIEW_SELF]
 
     def post(self, request, pk: int):
         user_id = _actor_user_id(request)
+        req = leave_selectors.get_leave_by_id(pk)
+        if not req:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+        if req.user_id != user_id:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+
         serializer = s.ResumptionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -141,7 +195,8 @@ class LeaveResumptionView(APIView):
 
 
 class MyBalancesView(APIView):
-    """View category leave balances and ledger transactions for caller in a given year."""
+    """View caller's leave balances and entitlements for a given year."""
+    permission_classes = [MODULE, P_VIEW_SELF]
 
     def get(self, request):
         user_id = _actor_user_id(request)
@@ -150,23 +205,37 @@ class MyBalancesView(APIView):
 
         balances = list(balance_selectors.get_user_balances(user_id=user_id, year=year))
         if not balances:
-            # Seed default balances on demand
             balances = balance_services.seed_default_balances(user_id=user_id, year=year)
 
-        serializer = s.LeaveBalanceSerializer(balances, many=True)
-        return Response(serializer.data)
+        return Response(s.LeaveBalanceSerializer(balances, many=True).data)
 
+
+# ── Workflow endpoints ────────────────────────────────────────────────────────
 
 class SubstituteQueueView(APIView):
-    """Queue of leave applications awaiting this substitute's response."""
+    """Queue of leave applications awaiting this user's substitute response."""
+    permission_classes = [MODULE, P_SUBSTITUTE]
 
     def get(self, request):
         user_id = _actor_user_id(request)
         qs = leave_selectors.pending_substitute_requests(user_id)
         return Response(s.LeaveRequestSerializer(qs, many=True).data)
 
+
+class SubstituteRespondView(APIView):
+    """Accept or decline substitute responsibility for a specific leave application."""
+    permission_classes = [MODULE, P_SUBSTITUTE]
+
     def post(self, request, pk: int):
         user_id = _actor_user_id(request)
+
+        # Verify caller is actually the designated substitute for this request
+        req = leave_selectors.get_leave_by_id(pk)
+        if not req:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+        if req.substitute_user_id != user_id:
+            raise PermissionDeniedError("You are not the designated substitute for this leave application.")
+
         serializer = s.SubstituteResponseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -183,19 +252,30 @@ class SubstituteQueueView(APIView):
             raise ConflictError(str(e)) from e
 
 
-class UnitHeadReviewView(APIView):
-    """Queue and decision endpoint for Unit Head reviews."""
+class UnitHeadQueueView(APIView):
+    """List applications assigned to this Unit Head that await review."""
+    permission_classes = [MODULE, P_REVIEW]
 
     def get(self, request):
         user_id = _actor_user_id(request)
-        # Unit Head sees requests assigned to them, or all pending reviews in dev
         qs = leave_selectors.pending_unit_head_reviews(unit_head_user_id=user_id)
-        if not qs.exists():
-            qs = leave_selectors.pending_unit_head_reviews()
         return Response(s.LeaveRequestSerializer(qs, many=True).data)
+
+
+class UnitHeadReviewView(APIView):
+    """Submit Unit Head recommendation or rejection for a specific application."""
+    permission_classes = [MODULE, P_REVIEW]
 
     def post(self, request, pk: int):
         user_id = _actor_user_id(request)
+
+        # Verify caller is the assigned Unit Head for this request
+        req = leave_selectors.get_leave_by_id(pk)
+        if not req:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+        if req.unit_head_user_id is not None and req.unit_head_user_id != user_id:
+            raise PermissionDeniedError("You are not the assigned Unit Head for this leave application.")
+
         serializer = s.UnitHeadReviewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -212,18 +292,31 @@ class UnitHeadReviewView(APIView):
             raise ConflictError(str(e)) from e
 
 
-class SanctionDecisionView(APIView):
-    """Queue and sanction decision endpoint for Competent Authority."""
+class SanctionQueueView(APIView):
+    """List applications awaiting sanction decision by this Competent Authority."""
+    permission_classes = [MODULE, P_SANCTION]
 
     def get(self, request):
         user_id = _actor_user_id(request)
         qs = leave_selectors.pending_sanctions(authority_user_id=user_id)
-        if not qs.exists():
-            qs = leave_selectors.pending_sanctions()
         return Response(s.LeaveRequestSerializer(qs, many=True).data)
+
+
+class SanctionDecisionView(APIView):
+    """Record final sanction or rejection by the Competent Authority."""
+    permission_classes = [MODULE, P_SANCTION]
 
     def post(self, request, pk: int):
         user_id = _actor_user_id(request)
+
+        req = leave_selectors.get_leave_by_id(pk)
+        if not req:
+            raise NotFoundError(f"Leave application #{pk} does not exist.")
+        # If a specific sanctioning authority is recorded, enforce it
+        if (req.sanctioning_authority_user_id is not None
+                and req.sanctioning_authority_user_id != user_id):
+            raise PermissionDeniedError("You are not the assigned Sanctioning Authority for this application.")
+
         serializer = s.SanctionDecisionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -240,8 +333,11 @@ class SanctionDecisionView(APIView):
             raise ConflictError(str(e)) from e
 
 
+# ── Admin / calendar endpoints ────────────────────────────────────────────────
+
 class HolidayCalendarView(APIView):
-    """Retrieve published holidays for a year."""
+    """Retrieve published holidays for a year (no special permission required beyond module access)."""
+    permission_classes = [MODULE, P_VIEW_SELF]
 
     def get(self, request):
         year_param = request.query_params.get("year")
