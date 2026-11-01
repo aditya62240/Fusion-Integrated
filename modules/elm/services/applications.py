@@ -223,3 +223,5 @@ def resume_duty(
             remarks=f"Duty resumed on {actual_resumption_date}. {remarks}".strip(),
         )
         return req
+
+        
